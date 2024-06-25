@@ -1,63 +1,139 @@
-version: '3'
+version: "3"
 
-x-airflow-common:
-  &airflow-common
+x-spark-common: &spark-common
+  image: bitnami/spark:latest
+  volumes:
+    - ./spark/jobs:/opt/bitnami/spark/jobs
+    - ./spark/resources:/opt/bitnami/spark/resources
+  networks:
+    - spark-flow
+
+x-airflow-common: &airflow-common
   build:
     context: .
-    dockerfile: Dockerfile
-  image: custom-airflow:2.7.1-python3.9
-  env_file:
-    - airflow.env
+    dockerfile: ./airflow/Dockerfile
+  env_file: ./airflow/.env
+  environment:
+    AIRFLOW__CORE__LOAD_EXAMPLES: ${_AIRFLOW__CORE__LOAD_EXAMPLES:-False}
+    AIRFLOW__CORE__EXECUTOR: ${_AIRFLOW__CORE__EXECUTOR:-LocalExecutor}
+    AIRFLOW__CORE_TEST_CONNECTION: ${_AIRFLOW__CORE_TEST_CONNECTION:-Enabled}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${_AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:-postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow}
+    AIRFLOW__WEBSERVER_BASE_URL: ${_AIRFLOW__WEBSERVER_BASE_URL:-http://localhost:8080}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${_AIRFLOW__WEBSERVER__SECRET_KEY:-_k2FmuZFxuyaIaPYUfSEp4Z3cs0V0kfcpLq9Iimkr3k}
+    GOOGLE_APPLICATION_CREDENTIALS: ${_GOOGLE_APPLICATION_CREDENTIALS:-/.google/credentials/project-mart-427214-fa427024edf2.json}
+    AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT: ${_AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT:-google-cloud-platform://?extra__google_cloud_platform__key_path=/.google/credentials/project-mart-427214-fa427024edf2.json}
+    GCP_PROJECT_ID: ${_GCP_PROJECT_ID:-project-mart-427214}
+    GCP_GCS_BUCKET: ${_GCP_GCS_BUCKET:-project-mart-bucket}
   volumes:
-    - ./config:/opt/airflow/config
-    - ./dags:/opt/airflow/dags
-    - ./data:/opt/airflow/data
-    - ./etls:/opt/airflow/etls
-    - ./logs:/opt/airflow/logs
-    - ./pipelines:/opt/airflow/pipelines
-    - ./plugins:/opt/airflow/plugins
-    - ./tests:/opt/airflow/tests
-    - ./utils:/opt/airflow/utils
-    #- ./airflow.cfg:/opt/airflow/airflow.cfg
-    - ./requirements.txt:/opt/airflow/requirements.txt
+    - ./project-mart-427214-fa427024edf2.json:/.google/credentials/project-mart-427214-fa427024edf2.json
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/output:/opt/airflow/output
+    - ./spark/jobs:/opt/airflow/spark/jobs
+    - ./spark/resources:/opt/airflow/spark/resources
   depends_on:
-    - postgres
-    - redis
+    - postgres-airflow
+  networks:
+    - spark-flow
 
 services:
-  postgres:
-    image: postgres:12
+  spark-master:
+    <<: *spark-common
+    container_name: spark-master
+    command: bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "9090:8080"
+      - "7077:7077"
+
+  spark-worker-1:
+    <<: *spark-common
+    container_name: spark-worker-1
+    command: bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: airflow_dskola_3
-      POSTGRES_PORT: 5432
+      SPARK_MODE: worker
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_MASTER_URL: spark://spark-master:7077
+
+  spark-worker-2:
+    <<: *spark-common
+    container_name: spark-worker-2
+    command: bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MODE: worker
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_MASTER_URL: spark://spark-master:7077
+
+  postgres-airflow:
+    image: postgres:14.0
+    container_name: postgres-airflow
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    networks:
+      - spark-flow
+
+  postgres-staging:
+    image: postgres:14.0
+    container_name: postgres-staging
     ports:
-      - "5431:5432"
-    expose:
-      - 5432
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: staging_db
+    volumes:
+      - ./postgres/initdb.sql:/docker-entrypoint-initdb.d/initdb.sql
+    networks:
+      - spark-flow
 
-  redis:
-    image: redis:latest
+  pgadmin:
+    container_name: pgadmin
+    image: dpage/pgadmin4
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    depends_on:
+      - postgres-staging
+    networks:
+      - spark-flow
     ports:
-      - "6379:6379"
+      - "5050:80"
 
-  airflow-init:
-    <<: *airflow-common
-    command: >
-      bash -c "pip install -r /opt/airflow/requirements.txt && airflow db init && airflow db upgrade && airflow users create --username admin --firstname admin --lastname admin --role Admin --email airflow@airflow.com --password admin"
-    restart: "no"
-
-  airflow-webserver:
+  webserver:
     <<: *airflow-common
     command: webserver
     ports:
       - "8080:8080"
+    depends_on:
+      - scheduler
+    restart: unless-stopped
 
-  airflow-scheduler:
+  scheduler:
     <<: *airflow-common
-    command: scheduler
+    command: bash -c "airflow db migrate && airflow users create --username admin --firstname Maulana --lastname 'Ahmad Maliki' --role Admin --email maulanamaliki2007@gmail.com --password admin && airflow scheduler"
 
-  airflow-worker:
-    <<: *airflow-common
-    command: celery worker
+  jupyter-spark:
+    image: jupyter/pyspark-notebook:spark-3.1.2
+    container_name: jupyter-spark
+    networks:
+      - spark-flow
+    ports:
+      - "8888:8888"
+      - "4040-4080:4040-4080"
+    volumes:
+      - ./project-mart-427214-fa427024edf2.json:/home/user/work/project-mart-427214-fa427024edf2.json
+      - ./spark/notebooks:/home/user/work/notebooks/
+      - ./spark/resources/jars:/home/user/work/jars/
+    environment:
+      - NOTEBOOK_DIR=/home/user/work
+    command: start-notebook.sh --NotebookApp.notebook_dir=/home/user/work
+
+networks:
+  spark-flow:
